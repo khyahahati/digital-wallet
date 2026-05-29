@@ -1,0 +1,21 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "postgres/migrations"
+    queries: "postgres/queries"
+    gen:
+      go:
+        package: "db"
+        out: "internal/db"
+        sql_package: "pgx/v5"
+        overrides:
+          - db_type: "pg_catalog.numeric"
+            go_type: "string"
+          - column: "entries.debit"
+            go_type: "string"
+          - column: "entries.credit"
+            go_type: "string"
+          - column: "accounts.balance"
+            go_type: "string"
+          - db_type: "operation_type"
+            go_type: "string"
