@@ -177,3 +177,8 @@ func (store *Store) ListEntries(ctx context.Context, limit int) ([]Entry, error)
 
 	return entries, rows.Err()
 }
+
+// Pool exposes the underlying pgxpool connection pool for raw database execution.
+func (store *Store) Pool() *pgxpool.Pool {
+	return store.db
+}

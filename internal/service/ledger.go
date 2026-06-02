@@ -263,3 +263,8 @@ func validatePositiveAmount(amountStr string) (decimal.Decimal, error) {
 	}
 	return amount, nil
 }
+
+// Store returns the underlying database store wrapper instance
+func (s *LedgerService) Store() *db.Store {
+	return s.store
+}

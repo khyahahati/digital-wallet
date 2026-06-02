@@ -94,27 +94,61 @@ func (s *Server) handleWithdraw(w http.ResponseWriter, r *http.Request) {
 	s.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Withdrawal processed successfully"})
 }
 
-// handleTransfer manages POST /accounts/transfer
+type secureTransferRequest struct {
+	ToAccountID string `json:"to_account_id"`
+	Amount      string `json:"amount"`
+	PaymentPin  string `json:"payment_pin"` // Your new required 6-digit pin input
+}
+
 func (s *Server) handleTransfer(w http.ResponseWriter, r *http.Request) {
-	var req transferRequest
+	// 1. Extract the securely authenticated UserID from the session middleware context
+	authUserID, ok := r.Context().Value("authenticated_user_id").(uuid.UUID)
+	if !ok {
+		s.respondWithError(w, http.StatusUnauthorized, "User session state unreadable")
+		return
+	}
+
+	var req secureTransferRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 
-	fromID, err := uuid.Parse(req.FromAccountID)
-	toID, err2 := uuid.Parse(req.ToAccountID)
-	if err != nil || err2 != nil {
-		s.respondWithError(w, http.StatusBadRequest, "Invalid sender or receiver UUID format")
+	// 2. Client-side protection boundary: Ensure payment pin is structurally 6 digits
+	if len(req.PaymentPin) != 6 {
+		s.respondWithError(w, http.StatusBadRequest, "Payment authorization PIN must be exactly 6 digits")
 		return
 	}
 
-	if err := s.service.Transfer(r.Context(), fromID, toID, req.Amount); err != nil {
+	toAccountUUID, err := uuid.Parse(req.ToAccountID)
+	if err != nil {
+		s.respondWithError(w, http.StatusBadRequest, "Invalid destination account ID formatting")
+		return
+	}
+
+	// 3. Security Check: Validate the user's 6-digit payment PIN before processing any math
+	if err := s.service.ValidatePaymentPin(r.Context(), authUserID, req.PaymentPin); err != nil {
+		s.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	// 4. Resolve the sender's internal ledger account ID using their authenticated UserID
+	var fromAccountID uuid.UUID
+	err = s.service.Store().Pool().QueryRow(r.Context(), 
+		"SELECT id FROM accounts WHERE user_id = $1;", authUserID,
+	).Scan(&fromAccountID)
+	if err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, "Unable to resolve your primary wallet account linkage")
+		return
+	}
+
+	// 5. Fire off our bulletproof, tested, serializable double-entry ledger transfer engine!
+	if err := s.service.Transfer(r.Context(), fromAccountID, toAccountUUID, req.Amount); err != nil {
 		s.handleDomainError(w, err)
 		return
 	}
 
-	s.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Transfer processed successfully"})
+	s.respondWithJSON(w, http.StatusOK, map[string]string{"message": "Transfer processed successfully in INR"})
 }
 
 // handleListAccounts manages GET /accounts
@@ -223,4 +257,126 @@ func isZeroAmount(value string) bool {
 		}
 	}
 	return true
+}
+
+type balanceCheckRequest struct {
+	BalancePin string `json:"balance_pin"` // Your new required 4-digit pin input
+}
+
+type statementRow struct {
+	Sr            int    `json:"sr"`
+	Date          string `json:"date"`
+	TransactionID string `json:"transaction_id"`
+	AccountName   string `json:"account_name"`
+	Amount        string `json:"amount"`
+	Type          string `json:"type"` // "credit" or "debit"
+}
+
+func (s *Server) handleGetBalance(w http.ResponseWriter, r *http.Request) {
+	authUserID, ok := r.Context().Value("authenticated_user_id").(uuid.UUID)
+	if !ok {
+		s.respondWithError(w, http.StatusUnauthorized, "User session state unreadable")
+		return
+	}
+
+	var req balanceCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	// 1. Enforce 4-digit pin structure validation
+	if len(req.BalancePin) != 4 {
+		s.respondWithError(w, http.StatusBadRequest, "Balance PIN must be exactly 4 digits")
+		return
+	}
+
+	// 2. Cryptographically verify the 4-digit PIN
+	if err := s.service.ValidateBalancePin(r.Context(), authUserID, req.BalancePin); err != nil {
+		s.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	// 3. Fetch the account information if PIN is correct
+	var name, balance, currency string
+	err := s.service.Store().Pool().QueryRow(r.Context(),
+		"SELECT name, balance, currency FROM accounts WHERE user_id = $1;", authUserID,
+	).Scan(&name, &balance, &currency)
+	if err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, "Account records unreadable")
+		return
+	}
+
+	s.respondWithJSON(w, http.StatusOK, map[string]string{
+		"account_name": name,
+		"balance":      balance,
+		"currency":     currency,
+	})
+}
+
+func (s *Server) handleGetStatement(w http.ResponseWriter, r *http.Request) {
+	authUserID, ok := r.Context().Value("authenticated_user_id").(uuid.UUID)
+	if !ok {
+		s.respondWithError(w, http.StatusUnauthorized, "User session state unreadable")
+		return
+	}
+
+	// 1. Resolve the user's primary wallet ledger account ID
+	var accountID uuid.UUID
+	err := s.service.Store().Pool().QueryRow(r.Context(),
+		"SELECT id FROM accounts WHERE user_id = $1;", authUserID,
+	).Scan(&accountID)
+	if err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, "Account linkage untraceable")
+		return
+	}
+
+	// 2. Query the exact historical records for this account, sorted by date, capped strictly to the latest 20 rows
+	rows, err := s.service.Store().Pool().Query(r.Context(), `
+		SELECT e.created_at, e.tx_id, a.name, e.amount
+		FROM entries e
+		JOIN accounts a ON e.account_id = a.id
+		WHERE e.tx_id IN (SELECT tx_id FROM entries WHERE account_id = $1)
+		  AND e.account_id != $1
+		ORDER BY e.created_at DESC
+		LIMIT 20;`,
+		accountID,
+	)
+	if err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve transaction statements")
+		return
+	}
+	defer rows.Close()
+
+	statement := []statementRow{}
+	sr := 1
+
+	for rows.Next() {
+		var createdAt time.Time
+		var txID uuid.UUID
+		var counterpartyName string
+		var rawAmount string
+
+		if err := rows.Scan(&createdAt, &txID, &counterpartyName, &rawAmount); err != nil {
+			continue
+		}
+
+		// 3. Mathematical type mapping: If amount starts with "-", it's a debit (red), else credit (green)
+		txType := "credit"
+		if strings.HasPrefix(rawAmount, "-") {
+			txType = "debit"
+		}
+
+		statement = append(statement, statementRow{
+			Sr:            sr,
+			Date:          createdAt.Format("02 Jan 2006 15:04"),
+			TransactionID: txID.String(),
+			AccountName:   counterpartyName,
+			Amount:        rawAmount,
+			Type:          txType,
+		})
+		sr++
+	}
+
+	s.respondWithJSON(w, http.StatusOK, statement)
 }
