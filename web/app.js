@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "https://esm.sh/react@18";
+import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18";
 import { createRoot } from "https://esm.sh/react-dom@18/client";
 import htm from "https://esm.sh/htm@3";
 
@@ -58,6 +58,105 @@ const isValidEmail = (value) => {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
 };
 
+const SegmentedPinInput = ({
+  length,
+  value,
+  onChange,
+  onComplete,
+  autoFocus = false,
+  disabled = false,
+  name,
+}) => {
+  const refs = useRef([]);
+  const digits = Array.from({ length }, (_, index) => value[index] || "");
+
+  useEffect(() => {
+    if (autoFocus && refs.current[0]) {
+      refs.current[0].focus();
+    }
+  }, [autoFocus]);
+
+  const emitChange = (nextDigits) => {
+    const nextValue = nextDigits.join("");
+    onChange(nextValue);
+    if (nextDigits.every((digit) => digit !== "") && nextDigits.length === length) {
+      onComplete?.(nextValue);
+    }
+  };
+
+  const handlePaste = (event) => {
+    event.preventDefault();
+    const pasted = event.clipboardData.getData("text").replace(/\D/g, "");
+    if (!pasted) return;
+    const nextDigits = Array.from({ length }, (_, index) => pasted[index] || "");
+    emitChange(nextDigits);
+    const lastIndex = Math.min(pasted.length, length) - 1;
+    if (lastIndex >= 0 && refs.current[lastIndex]) {
+      refs.current[lastIndex].focus();
+    }
+  };
+
+  const handleChange = (index, event) => {
+    const nextValue = event.target.value.replace(/\D/g, "");
+    const nextDigits = [...digits];
+
+    if (nextValue.length > 1) {
+      for (let i = 0; i < nextValue.length && index + i < length; i += 1) {
+        nextDigits[index + i] = nextValue[i];
+      }
+      emitChange(nextDigits);
+      const nextIndex = Math.min(index + nextValue.length, length - 1);
+      refs.current[nextIndex]?.focus();
+      return;
+    }
+
+    nextDigits[index] = nextValue;
+    emitChange(nextDigits);
+
+    if (nextValue && refs.current[index + 1]) {
+      refs.current[index + 1].focus();
+    }
+  };
+
+  const handleKeyDown = (index, event) => {
+    if (event.key !== "Backspace") return;
+    if (digits[index]) {
+      const nextDigits = [...digits];
+      nextDigits[index] = "";
+      emitChange(nextDigits);
+      return;
+    }
+    if (refs.current[index - 1]) {
+      refs.current[index - 1].focus();
+    }
+  };
+
+  return html`
+    <div class="pin-grid" onPaste=${handlePaste}>
+      ${digits.map(
+        (digit, index) => html`
+          <input
+            key=${`${name}-${index}`}
+            ref=${(node) => {
+              refs.current[index] = node;
+            }}
+            type="password"
+            inputMode="numeric"
+            pattern="\\d*"
+            maxLength="1"
+            class="pin-cell"
+            value=${digit}
+            onChange=${(event) => handleChange(index, event)}
+            onKeyDown=${(event) => handleKeyDown(index, event)}
+            disabled=${disabled}
+            aria-label=${`Digit ${index + 1}`}
+          />
+        `
+      )}
+    </div>
+  `;
+};
+
 const App = () => {
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem(THEME_KEY) || "light";
@@ -66,6 +165,7 @@ const App = () => {
     return sessionStorage.getItem(TOKEN_KEY) || "";
   });
   const [userProfile, setUserProfile] = useState(() => readStoredUser());
+  const [showAuthCard, setShowAuthCard] = useState(false);
   const [authTab, setAuthTab] = useState("login");
   const [loginStep, setLoginStep] = useState(1);
   const [signupStep, setSignupStep] = useState(1);
@@ -85,6 +185,13 @@ const App = () => {
   const [statement, setStatement] = useState([]);
   const [balancePinInput, setBalancePinInput] = useState("");
   const [balancePinStashed, setBalancePinStashed] = useState("");
+  const [showBalanceValue, setShowBalanceValue] = useState(true);
+  const [showHistory, setShowHistory] = useState(false);
+  const [activePanel, setActivePanel] = useState(null);
+  const [signupPasswordVisible, setSignupPasswordVisible] = useState(false);
+  const [signupConfirmVisible, setSignupConfirmVisible] = useState(false);
+  const [loginPasswordVisible, setLoginPasswordVisible] = useState(false);
+  const [mfaSetupCode, setMfaSetupCode] = useState("");
   const [paymentForm, setPaymentForm] = useState({
     destinationUserId: "",
     amount: "",
@@ -135,6 +242,29 @@ const App = () => {
     setUserProfile(profile || null);
   };
 
+  const resetAuthFlow = () => {
+    setAuthTab("login");
+    setLoginStep(1);
+    setSignupStep(1);
+    setLoginUserId("");
+    setAuthError("");
+    setAuthLoading(false);
+    setIsMfaSetupVisible(false);
+    setRegisterResult(null);
+    setSignupForm({
+      fullName: "",
+      email: "",
+      bankName: "",
+      accountNumber: "",
+      password: "",
+      confirmPassword: "",
+      balancePin: "",
+      paymentPin: "",
+    });
+    setLoginForm({ email: "", password: "", otp: "" });
+    setMfaSetupCode("");
+  };
+
   const clearSession = () => {
     sessionStorage.removeItem(TOKEN_KEY);
     sessionStorage.removeItem(USER_KEY);
@@ -144,6 +274,11 @@ const App = () => {
     setStatement([]);
     setBalancePinInput("");
     setBalancePinStashed("");
+    setActivePanel(null);
+    setShowHistory(false);
+    setShowBalanceValue(true);
+    setShowAuthCard(false);
+    resetAuthFlow();
   };
 
   const parseError = async (response) => {
@@ -290,18 +425,17 @@ const App = () => {
     }
   };
 
-  const handleLoginStep2 = async (event) => {
-    event.preventDefault();
-    setAuthError("");
-    if (!isExactDigits(loginForm.otp, 6)) {
+  const submitLoginStep2 = async (code) => {
+    if (!isExactDigits(code, 6)) {
       setAuthError("Enter the 6-digit authenticator code.");
       return;
     }
     setAuthLoading(true);
+    setAuthError("");
     try {
       const data = await postJson("/auth/login/step2", {
         user_id: loginUserId,
-        mfa_token: loginForm.otp.trim(),
+        mfa_token: code.trim(),
       });
       if (data?.token) {
         storeSession(data.token, data?.user || null);
@@ -318,20 +452,24 @@ const App = () => {
     }
   };
 
-  const handleBalanceReveal = async (event) => {
-    event.preventDefault();
+  const handleBalanceReveal = async (overridePin) => {
     setBalanceError("");
-    if (!isExactDigits(balancePinInput, 4)) {
+    const pinValue = (overridePin ?? balancePinInput).trim();
+    if (!isExactDigits(pinValue, 4)) {
       setBalanceError("Balance PIN must be exactly 4 digits.");
       return;
     }
-    await refreshBalance(balancePinInput);
+    await refreshBalance(pinValue);
     setBalancePinInput("");
   };
 
   const handleTransfer = async (event) => {
     event.preventDefault();
     setTransferError("");
+    if (!paymentForm.destinationUserId.trim()) {
+      setTransferError("Payment ID is required.");
+      return;
+    }
     if (!isPositiveAmount(paymentForm.amount)) {
       setTransferError("Amount must be a positive value.");
       return;
@@ -345,7 +483,7 @@ const App = () => {
       await postJson(
         "/accounts/transfer",
         {
-          destination_user_id: paymentForm.destinationUserId.trim(),
+          to_account_id: paymentForm.destinationUserId.trim(),
           amount: paymentForm.amount.trim(),
           payment_pin: paymentForm.paymentPin.trim(),
         },
@@ -353,6 +491,7 @@ const App = () => {
       );
       showToast("Transfer completed successfully.");
       setPaymentForm({ destinationUserId: "", amount: "", paymentPin: "" });
+      setActivePanel(null);
       await Promise.all([
         refreshStatement(),
         balancePinStashed ? refreshBalance(balancePinStashed) : null,
@@ -371,143 +510,115 @@ const App = () => {
       ? formatRupee(amountValue)
       : `-${formatRupee(amountValue)}`;
     return html`
-      <tr key=${entry?.id || `${entry?.transaction_id}-${index}`}>
-        <td>${index + 1}</td>
-        <td>${formatDate(entry?.date || entry?.created_at || entry?.timestamp)}</td>
-        <td class="mono">${entry?.transaction_id || "--"}</td>
-        <td>${entry?.account_name || entry?.account || "--"}</td>
-        <td>${entry?.type || "--"}</td>
-        <td class=${isCredit ? "amount-positive" : "amount-negative"}>
+      <div class="history-row" key=${entry?.id || `${entry?.transaction_id}-${index}`}>
+        <div>
+          <p class="history-title">${entry?.account_name || entry?.account || "Ledger"}</p>
+          <p class="history-meta">${formatDate(entry?.date || entry?.created_at || entry?.timestamp)}</p>
+        </div>
+        <div class=${`history-amount ${isCredit ? "positive" : "negative"}`}>
           ${displayAmount}
-        </td>
-      </tr>
+        </div>
+      </div>
     `;
   });
 
-  if (!isAuthenticated) {
-    const isStep1Valid =
-      signupForm.fullName.trim().length > 0 && isValidEmail(signupForm.email);
-    const isStep2Valid =
-      signupForm.bankName.trim().length > 0 &&
-      signupForm.accountNumber.trim().length > 0 &&
-      signupForm.password.trim().length > 0 &&
-      signupForm.confirmPassword.trim().length > 0 &&
-      signupForm.password.trim() === signupForm.confirmPassword.trim();
-    const isStep3Valid =
-      isExactDigits(signupForm.balancePin, 4) &&
-      isExactDigits(signupForm.paymentPin, 6);
+  const isStep1Valid =
+    signupForm.fullName.trim().length > 0 && isValidEmail(signupForm.email);
+  const isStep2Valid =
+    signupForm.bankName.trim().length > 0 &&
+    signupForm.accountNumber.trim().length > 0 &&
+    signupForm.password.trim().length > 0 &&
+    signupForm.confirmPassword.trim().length > 0 &&
+    signupForm.password.trim() === signupForm.confirmPassword.trim();
+  const isStep3Valid =
+    isExactDigits(signupForm.balancePin, 4) &&
+    isExactDigits(signupForm.paymentPin, 6);
 
+  if (!isAuthenticated) {
     return html`
-      <div class="app auth-screen">
+      <div class="app shell">
         ${toast ? html`<div class="toast">${toast}</div>` : null}
         <header class="topbar">
-          <div class="brand">
-            <p class="eyebrow">Secure Wallet Portal</p>
-            <h1>Digital Banking Wallet</h1>
-            <p>Multi-factor protected access to your INR accounts.</p>
-          </div>
           <button
+            class="icon-button"
             type="button"
-            class="theme-toggle"
             onClick=${() => setTheme(theme === "light" ? "dark" : "light")}
+            aria-label="Toggle theme"
+            title="Toggle theme"
           >
-            ${theme === "light" ? "Dark Mode" : "Light Mode"}
+            ${theme === "light" ? "◐" : "◑"}
           </button>
+          <div class="nav-actions">
+            <button
+              class="primary-button"
+              type="button"
+              onClick=${() => setShowAuthCard(true)}
+            >
+              Log In / Sign Up
+            </button>
+          </div>
         </header>
 
-        <section class="auth-panel">
-          <div class="auth-tabs">
-            <button
-              class=${`tab-button ${authTab === "login" ? "active" : ""}`}
-              type="button"
-              onClick=${() => {
-                setAuthTab("login");
-                setAuthError("");
-              }}
-            >
-              Log In
-            </button>
-            <button
-              class=${`tab-button ${authTab === "signup" ? "active" : ""}`}
-              type="button"
-              onClick=${() => {
-                setAuthTab("signup");
-                setAuthError("");
-              }}
-            >
-              Sign Up
-            </button>
-          </div>
+        <main class="stage">
+          <section class=${`hero ${showAuthCard ? "is-hidden" : "is-visible"}`}>
+            <h1 class="hero-title gradient-text">Welcome to Digital-Wallet!</h1>
+          </section>
 
-          ${authError
-            ? html`<div class="error-box">${authError}</div>`
-            : null}
-
-          ${authTab === "signup"
-            ? isMfaSetupVisible
-              ? html`
-                  <div class="mfa-card">
-                    <h4>MFA Setup</h4>
-                    ${registerResult?.secret
-                      ? html`<p class="mono">${registerResult.secret}</p>`
-                      : null}
-                    ${registerResult?.mfaQRCode || registerResult?.MFAQRCode
-                      ? html`
-                          <div class="qr-wrap">
-                            <img
-                              src=${`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(
-                                registerResult?.mfaQRCode || registerResult?.MFAQRCode
-                              )}`}
-                              alt="MFA QR Code"
-                            />
-                          </div>
-                        `
-                      : null}
-                    <p class="muted">
-                      Scan this QR code with your authenticator app before logging in.
-                    </p>
-                    <button
-                      class="primary-button"
-                      type="button"
-                      onClick=${() => {
-                        setIsMfaSetupVisible(false);
-                        setAuthTab("login");
-                        setLoginStep(1);
-                        setSignupStep(1);
-                        setSignupForm({
-                          fullName: "",
-                          email: "",
-                          bankName: "",
-                          accountNumber: "",
-                          password: "",
-                          confirmPassword: "",
-                          balancePin: "",
-                          paymentPin: "",
-                        });
-                      }}
-                    >
-                      I have scanned the QR code. Proceed to Login
-                    </button>
-                  </div>
-                `
-              : html`
-                  <div class="wizard">
-                    <div class="wizard-steps">
-                      <span class=${`wizard-pill ${signupStep === 1 ? "active" : ""}`}>
-                        1. Personal Info
-                      </span>
-                      <span class=${`wizard-pill ${signupStep === 2 ? "active" : ""}`}>
-                        2. Banking Credentials
-                      </span>
-                      <span class=${`wizard-pill ${signupStep === 3 ? "active" : ""}`}>
-                        3. Security PINs
-                      </span>
+          <section class=${`auth-card ${showAuthCard ? "is-visible" : "is-hidden"}`}>
+            ${authError ? html`<div class="error-box">${authError}</div>` : null}
+            ${authTab === "signup"
+              ? isMfaSetupVisible
+                ? html`
+                    <div class="stack">
+                      <h2 class="section-title">Secure MFA Setup</h2>
+                      ${registerResult?.mfaQRCode || registerResult?.MFAQRCode
+                        ? html`
+                            <div class="qr-wrap">
+                              <img
+                                src=${`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(
+                                  registerResult?.mfaQRCode || registerResult?.MFAQRCode
+                                )}`}
+                                alt="MFA QR Code"
+                              />
+                            </div>
+                          `
+                        : null}
+                      <p class="muted">
+                        Scan the code in your authenticator app, then enter your 6-digit verification code.
+                      </p>
+                      <${SegmentedPinInput}
+                        length=${6}
+                        value=${mfaSetupCode}
+                        onChange=${setMfaSetupCode}
+                        onComplete=${() => {
+                          setIsMfaSetupVisible(false);
+                          resetAuthFlow();
+                          setShowAuthCard(true);
+                        }}
+                        autoFocus=${true}
+                        name="mfa-setup"
+                      />
+                      <button
+                        class="primary-button"
+                        type="button"
+                        disabled=${!isExactDigits(mfaSetupCode, 6)}
+                        onClick=${() => {
+                          setIsMfaSetupVisible(false);
+                          resetAuthFlow();
+                          setShowAuthCard(true);
+                        }}
+                      >
+                        Continue to Login
+                      </button>
                     </div>
-
-                    ${signupStep === 1
-                      ? html`
-                          <form class="form-stack" onSubmit=${(event) => event.preventDefault()}>
-                            <div class="form-grid">
+                  `
+                : html`
+                    <div class="stack">
+                      <h2 class="section-title">Create Secure Wallet</h2>
+                      <div class="progress-pill">${signupStep}/3</div>
+                      ${signupStep === 1
+                        ? html`
+                            <form class="form-stack" onSubmit=${(event) => event.preventDefault()}>
                               <label class="field">
                                 <span>Full Name</span>
                                 <input
@@ -531,40 +642,25 @@ const App = () => {
                                       ...prev,
                                       email: event.target.value,
                                     }))}
-                                  placeholder="priya@bank.com"
+                                  placeholder="you@bank.com"
                                   required
                                 />
                               </label>
-                            </div>
-                            <p class="muted">
-                              Your new account is pre-funded with a ₹10000 test balance.
-                            </p>
-                            <div class="form-actions">
-                              <span class="muted">Step 1 of 3</span>
                               <button
                                 class="primary-button"
                                 type="button"
                                 disabled=${!isStep1Valid}
-                                onClick=${() => {
-                                  if (!isStep1Valid) {
-                                    setAuthError("Enter your name and a valid email.");
-                                    return;
-                                  }
-                                  setAuthError("");
-                                  setSignupStep(2);
-                                }}
+                                onClick=${() => setSignupStep(2)}
                               >
                                 Next
                               </button>
-                            </div>
-                          </form>
-                        `
-                      : null}
+                            </form>
+                          `
+                        : null}
 
-                    ${signupStep === 2
-                      ? html`
-                          <form class="form-stack" onSubmit=${(event) => event.preventDefault()}>
-                            <div class="form-grid">
+                      ${signupStep === 2
+                        ? html`
+                            <form class="form-stack" onSubmit=${(event) => event.preventDefault()}>
                               <label class="field">
                                 <span>Bank Name</span>
                                 <input
@@ -574,12 +670,12 @@ const App = () => {
                                       ...prev,
                                       bankName: event.target.value,
                                     }))}
-                                  placeholder="National Bank"
+                                  placeholder="Axis Bank"
                                   required
                                 />
                               </label>
                               <label class="field">
-                                <span>Account Number</span>
+                                <span>Account ID</span>
                                 <input
                                   value=${signupForm.accountNumber}
                                   onChange=${(event) =>
@@ -587,138 +683,131 @@ const App = () => {
                                       ...prev,
                                       accountNumber: event.target.value,
                                     }))}
-                                  placeholder="000111222333"
+                                  placeholder="0092910"
                                   required
                                 />
                               </label>
                               <label class="field">
-                                <span>Web Banking Password</span>
-                                <input
-                                  type="password"
-                                  value=${signupForm.password}
-                                  onChange=${(event) =>
-                                    setSignupForm((prev) => ({
-                                      ...prev,
-                                      password: event.target.value,
-                                    }))}
-                                  placeholder="Enter password"
-                                  required
-                                />
+                                <span>Web-Banking Password</span>
+                                <div class="input-with-icon">
+                                  <input
+                                    type=${signupPasswordVisible ? "text" : "password"}
+                                    value=${signupForm.password}
+                                    onChange=${(event) =>
+                                      setSignupForm((prev) => ({
+                                        ...prev,
+                                        password: event.target.value,
+                                      }))}
+                                    placeholder="Password"
+                                    required
+                                  />
+                                  <button
+                                    class="eye-button"
+                                    type="button"
+                                    onClick=${() =>
+                                      setSignupPasswordVisible((prev) => !prev)}
+                                    aria-label="Toggle password visibility"
+                                  >
+                                    ${signupPasswordVisible ? "Hide" : "Show"}
+                                  </button>
+                                </div>
                               </label>
                               <label class="field">
                                 <span>Confirm Password</span>
-                                <input
-                                  type="password"
-                                  value=${signupForm.confirmPassword}
-                                  onChange=${(event) =>
-                                    setSignupForm((prev) => ({
-                                      ...prev,
-                                      confirmPassword: event.target.value,
-                                    }))}
-                                  placeholder="Re-enter password"
-                                  required
-                                />
+                                <div class="input-with-icon">
+                                  <input
+                                    type=${signupConfirmVisible ? "text" : "password"}
+                                    value=${signupForm.confirmPassword}
+                                    onChange=${(event) =>
+                                      setSignupForm((prev) => ({
+                                        ...prev,
+                                        confirmPassword: event.target.value,
+                                      }))}
+                                    placeholder="Confirm password"
+                                    required
+                                  />
+                                  <button
+                                    class="eye-button"
+                                    type="button"
+                                    onClick=${() =>
+                                      setSignupConfirmVisible((prev) => !prev)}
+                                    aria-label="Toggle password visibility"
+                                  >
+                                    ${signupConfirmVisible ? "Hide" : "Show"}
+                                  </button>
+                                </div>
                               </label>
-                            </div>
-                            <div class="form-actions">
-                              <button
-                                class="ghost-button"
-                                type="button"
-                                onClick=${() => setSignupStep(1)}
-                              >
-                                Back
-                              </button>
-                              <button
-                                class="primary-button"
-                                type="button"
-                                disabled=${!isStep2Valid}
-                                onClick=${() => {
-                                  if (!isStep2Valid) {
-                                    setAuthError("Password and confirm password must match.");
-                                    return;
-                                  }
-                                  if (!isAlphanumericPassword(signupForm.password)) {
-                                    setAuthError(
-                                      "Password must be alphanumeric with letters and numbers."
-                                    );
-                                    return;
-                                  }
-                                  setAuthError("");
-                                  setSignupStep(3);
-                                }}
-                              >
-                                Next
-                              </button>
-                            </div>
-                          </form>
-                        `
-                      : null}
+                              <div class="form-actions">
+                                <button
+                                  class="ghost-button"
+                                  type="button"
+                                  onClick=${() => setSignupStep(1)}
+                                >
+                                  Back
+                                </button>
+                                <button
+                                  class="primary-button"
+                                  type="button"
+                                  disabled=${!isStep2Valid}
+                                  onClick=${() => setSignupStep(3)}
+                                >
+                                  Next
+                                </button>
+                              </div>
+                            </form>
+                          `
+                        : null}
 
-                    ${signupStep === 3
-                      ? html`
-                          <form class="form-stack" onSubmit=${handleSignup}>
-                            <div class="form-grid">
+                      ${signupStep === 3
+                        ? html`
+                            <form class="form-stack" onSubmit=${handleSignup}>
                               <label class="field">
-                                <span>4-digit Security PIN</span>
-                                <input
-                                  type="password"
-                                  inputmode="numeric"
-                                  pattern="[0-9]*"
+                                <span>Create 4-Digit Balance PIN</span>
+                                <${SegmentedPinInput}
+                                  length=${4}
                                   value=${signupForm.balancePin}
-                                  onChange=${(event) =>
-                                    setSignupForm((prev) => ({
-                                      ...prev,
-                                      balancePin: event.target.value,
-                                    }))}
-                                  placeholder="0000"
-                                  required
+                                  onChange=${(value) =>
+                                    setSignupForm((prev) => ({ ...prev, balancePin: value }))}
+                                  name="balance-pin"
                                 />
                               </label>
                               <label class="field">
-                                <span>6-digit Payment PIN</span>
-                                <input
-                                  type="password"
-                                  inputmode="numeric"
-                                  pattern="[0-9]*"
+                                <span>Create 6-Digit Payment PIN</span>
+                                <${SegmentedPinInput}
+                                  length=${6}
                                   value=${signupForm.paymentPin}
-                                  onChange=${(event) =>
-                                    setSignupForm((prev) => ({
-                                      ...prev,
-                                      paymentPin: event.target.value,
-                                    }))}
-                                  placeholder="000000"
-                                  required
+                                  onChange=${(value) =>
+                                    setSignupForm((prev) => ({ ...prev, paymentPin: value }))}
+                                  name="payment-pin"
                                 />
                               </label>
-                            </div>
-                            <div class="form-actions">
-                              <button
-                                class="ghost-button"
-                                type="button"
-                                onClick=${() => setSignupStep(2)}
-                              >
-                                Back
-                              </button>
-                              <button
-                                class="primary-button"
-                                type="submit"
-                                disabled=${authLoading || !isStep3Valid}
-                              >
-                                Submit Registration
-                              </button>
-                            </div>
-                            <p class="muted">POST /auth/register</p>
-                          </form>
-                        `
-                      : null}
-                  </div>
-                `
-            : html`
-                <div class="login-flow">
-                  <div class="login-step">
-                    <h3>${loginStep === 1 ? "Login Step 1" : "Login Step 2"}</h3>
+                              <div class="form-actions">
+                                <button
+                                  class="ghost-button"
+                                  type="button"
+                                  onClick=${() => setSignupStep(2)}
+                                >
+                                  Back
+                                </button>
+                                <button
+                                  class="primary-button"
+                                  type="submit"
+                                  disabled=${authLoading || !isStep3Valid}
+                                >
+                                  ${authLoading ? "Creating..." : "Create Secure Wallet"}
+                                </button>
+                              </div>
+                            </form>
+                          `
+                        : null}
+                    </div>
+                  `
+              : html`
+                  <div class="stack">
                     ${loginStep === 1
                       ? html`
+                          <h2 class="section-title gradient-text">Welcome back!</h2>
+                          <div class="progress-pill">1/2</div>
                           <form class="form-stack" onSubmit=${handleLoginStep1}>
                             <label class="field">
                               <span>Email ID</span>
@@ -730,276 +819,261 @@ const App = () => {
                                     ...prev,
                                     email: event.target.value,
                                   }))}
+                                placeholder="you@bank.com"
                                 required
                               />
                             </label>
                             <label class="field">
-                              <span>Password</span>
-                              <input
-                                type="password"
-                                value=${loginForm.password}
-                                onChange=${(event) =>
-                                  setLoginForm((prev) => ({
-                                    ...prev,
-                                    password: event.target.value,
-                                  }))}
-                                required
-                              />
+                              <span>Web-Banking Password</span>
+                              <div class="input-with-icon">
+                                <input
+                                  type=${loginPasswordVisible ? "text" : "password"}
+                                  value=${loginForm.password}
+                                  onChange=${(event) =>
+                                    setLoginForm((prev) => ({
+                                      ...prev,
+                                      password: event.target.value,
+                                    }))}
+                                  placeholder="Password"
+                                  required
+                                />
+                                <button
+                                  class="eye-button"
+                                  type="button"
+                                  onClick=${() => setLoginPasswordVisible((prev) => !prev)}
+                                  aria-label="Toggle password visibility"
+                                >
+                                  ${loginPasswordVisible ? "Hide" : "Show"}
+                                </button>
+                              </div>
                             </label>
-                            <div class="form-actions">
-                              <span class="muted">POST /auth/login/step1</span>
-                              <button
-                                class="primary-button"
-                                type="submit"
-                                disabled=${authLoading}
-                              >
-                                Continue
-                              </button>
-                            </div>
+                            <button class="primary-button" type="submit" disabled=${authLoading}>
+                              ${authLoading ? "Verifying..." : "Continue"}
+                            </button>
                           </form>
                         `
                       : html`
-                          <form class="form-stack" onSubmit=${handleLoginStep2}>
-                            <label class="field">
-                              <span>6-digit Authenticator Token</span>
-                              <input
-                                value=${loginForm.otp}
-                                onChange=${(event) =>
-                                  setLoginForm((prev) => ({
-                                    ...prev,
-                                    otp: event.target.value,
-                                  }))}
-                                placeholder="000000"
-                                required
-                              />
-                            </label>
-                            <div class="form-actions">
-                              <button
-                                class="ghost-button"
-                                type="button"
-                                onClick=${() => setLoginStep(1)}
-                              >
-                                Back
-                              </button>
-                              <button
-                                class="primary-button"
-                                type="submit"
-                                disabled=${authLoading}
-                              >
-                                Verify & Enter
-                              </button>
-                            </div>
-                          </form>
+                          <h2 class="section-title">Verification</h2>
+                          <div class="progress-pill">2/2</div>
+                          <${SegmentedPinInput}
+                            length=${6}
+                            value=${loginForm.otp}
+                            onChange=${(value) =>
+                              setLoginForm((prev) => ({ ...prev, otp: value }))}
+                            onComplete=${submitLoginStep2}
+                            autoFocus=${true}
+                            disabled=${authLoading}
+                            name="login-otp"
+                          />
+                          <button
+                            class="ghost-button"
+                            type="button"
+                            onClick=${() => {
+                              setLoginStep(1);
+                              setLoginForm((prev) => ({ ...prev, otp: "" }));
+                              setAuthError("");
+                            }}
+                          >
+                            Back to credentials
+                          </button>
                         `}
                   </div>
+                `}
 
-                  <div class="mfa-card">
-                    <h4>Two-Step Protection</h4>
-                    <p>
-                      Step 2 requires your rolling 6-digit authenticator token. Keep it ready.
-                    </p>
-                  </div>
-                </div>
-              `}
-        </section>
+            <button
+              class="link-button"
+              type="button"
+              onClick=${() => {
+                setAuthTab(authTab === "login" ? "signup" : "login");
+                setAuthError("");
+                setLoginStep(1);
+                setSignupStep(1);
+              }}
+            >
+              ${authTab === "login"
+                ? "New here? Create an account"
+                : "Already registered? Log in"}
+            </button>
+          </section>
+        </main>
       </div>
     `;
   }
 
   return html`
-    <div class="app dashboard">
+    <div class="app shell">
       ${toast ? html`<div class="toast">${toast}</div>` : null}
       <header class="topbar">
-        <div class="brand">
-          <p class="eyebrow">Secure Dashboard</p>
-          <h1>Digital Banking Wallet</h1>
-          <p>Live INR ledger with secured balance and payment controls.</p>
-        </div>
-        <div class="header-actions">
+        <button
+          class="icon-button"
+          type="button"
+          onClick=${() => setTheme(theme === "light" ? "dark" : "light")}
+          aria-label="Toggle theme"
+          title="Toggle theme"
+        >
+          ${theme === "light" ? "◐" : "◑"}
+        </button>
+        <div class="nav-actions">
           <button
+            class="ghost-button"
             type="button"
-            class="theme-toggle"
-            onClick=${() => setTheme(theme === "light" ? "dark" : "light")}
+            onClick=${() => setActivePanel("payment")}
           >
-            ${theme === "light" ? "Dark Mode" : "Light Mode"}
+            💸 Make a Payment
           </button>
-          <button type="button" class="ghost-button" onClick=${clearSession}>
-            Log Out
+          <button
+            class="ghost-button"
+            type="button"
+            onClick=${() => setActivePanel("balance")}
+          >
+            📊 View Balance
+          </button>
+          <button class="ghost-button" type="button" onClick=${clearSession}>
+            🚪 Sign Out
           </button>
         </div>
       </header>
 
-      <section class="greeting">
-        <h2>Welcome, ${displayName}</h2>
-      </section>
+      <main class="stage">
+        <section class="hero is-visible">
+          <h1 class="hero-title gradient-text">Welcome ${displayName}!</h1>
+        </section>
+      </main>
 
-      <section class="dashboard-grid">
-        <div class="panel">
-          <div class="panel-header">
-            <div>
-              <h3>Secure Balance Viewer</h3>
-              <p class="muted">Currency: ${formatCurrency(balanceData?.currency)}</p>
-            </div>
-            <button
-              type="button"
-              class="ghost-button"
-              onClick=${() => setBalanceData(null)}
-              disabled=${balanceLoading}
-            >
-              Mask Balance
-            </button>
-          </div>
+      ${activePanel
+        ? html`
+            <div class="overlay" role="dialog" aria-modal="true">
+              <div class="overlay-card">
+                <div class="overlay-header">
+                  <h2 class="section-title">
+                    ${activePanel === "balance" ? "View Balance" : "Make a Payment"}
+                  </h2>
+                  <button
+                    class="icon-button"
+                    type="button"
+                    onClick=${() => setActivePanel(null)}
+                    aria-label="Close"
+                  >
+                    ✕
+                  </button>
+                </div>
 
-          <div class="balance-card">
-            ${balanceData
-              ? html`
-                  <div class="balance-meta">
-                    <span class="label">Account Name</span>
-                    <strong>${balanceData?.account_name || "--"}</strong>
-                  </div>
-                  <div class="balance-meta">
-                    <span class="label">Balance</span>
-                    <strong class="balance-amount">
-                      ${formatRupee(balanceData?.balance || "0")}
-                    </strong>
-                  </div>
-                `
-              : html`
-                  <div class="masked">
-                    <div class="mask-line"></div>
-                    <div class="mask-line short"></div>
-                    <p class="muted">Balance hidden</p>
-                  </div>
-                `}
-          </div>
+                ${activePanel === "balance"
+                  ? html`
+                      <div class="stack">
+                        ${balanceData
+                          ? null
+                          : html`
+                              <label class="field">
+                                <span>Enter 4-digit Balance PIN</span>
+                                <${SegmentedPinInput}
+                                  length=${4}
+                                  value=${balancePinInput}
+                                  onChange=${setBalancePinInput}
+                                  onComplete=${handleBalanceReveal}
+                                  autoFocus=${true}
+                                  disabled=${balanceLoading}
+                                  name="balance-reveal"
+                                />
+                              </label>
+                            `}
+                        ${balanceError ? html`<div class="error-box">${balanceError}</div>` : null}
+                        <div class="balance-display">
+                          <div>
+                            <p class="label">Balance</p>
+                            <p class="balance-amount">
+                              ${balanceData
+                                ? showBalanceValue
+                                  ? `${formatRupee(balanceData?.balance || "0")} ${formatCurrency(
+                                      balanceData?.currency
+                                    )}`
+                                  : "******"
+                                : "******"}
+                            </p>
+                          </div>
+                          <button
+                            class="ghost-button"
+                            type="button"
+                            onClick=${() => setShowBalanceValue((prev) => !prev)}
+                            disabled=${!balanceData}
+                          >
+                            ${showBalanceValue ? "Hide Balance" : "Show Balance"}
+                          </button>
+                        </div>
 
-          <form class="pin-row" onSubmit=${handleBalanceReveal}>
-            <label class="field">
-              <span>4-digit Balance PIN</span>
-              <input
-                value=${balancePinInput}
-                onChange=${(event) => setBalancePinInput(event.target.value)}
-                placeholder="0000"
-                required
-              />
-            </label>
-            <button
-              type="submit"
-              class="primary-button"
-              disabled=${balanceLoading}
-            >
-              View Balance
-            </button>
-          </form>
-          ${balanceError ? html`<div class="error-box">${balanceError}</div>` : null}
-
-            <div class="statement">
-            <div class="statement-header">
-              <h4>Latest 20 Transactions</h4>
-              <span class="muted">GET /accounts/statement</span>
-            </div>
-              ${statementError
-                ? html`<div class="error-box">${statementError}</div>`
-                : null}
-            <div class="table-card">
-              <div class="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Sr.</th>
-                      <th>Date</th>
-                      <th>Transaction ID</th>
-                      <th>Account Name</th>
-                      <th>Type</th>
-                      <th>Amount</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${statementLoading
-                      ? html`
-                          <tr>
-                            <td colSpan="6">Loading statement...</td>
-                          </tr>
-                        `
-                      : statementRows.length
-                      ? statementRows
-                      : html`
-                          <tr>
-                            <td colSpan="6">No statement records found.</td>
-                          </tr>
-                        `}
-                  </tbody>
-                </table>
+                        <button
+                          class="accordion"
+                          type="button"
+                          onClick=${() => setShowHistory((prev) => !prev)}
+                        >
+                          Transaction History
+                          <span>${showHistory ? "-" : "+"}</span>
+                        </button>
+                        ${showHistory
+                          ? html`
+                              <div class="history-panel">
+                                ${statementLoading
+                                  ? html`<p class="muted">Loading history...</p>`
+                                  : null}
+                                ${statementError
+                                  ? html`<div class="error-box">${statementError}</div>`
+                                  : null}
+                                ${statementRows.length
+                                  ? statementRows
+                                  : html`<p class="muted">No transactions yet.</p>`}
+                              </div>
+                            `
+                          : null}
+                      </div>
+                    `
+                  : html`
+                      <form class="form-stack" onSubmit=${handleTransfer}>
+                        <label class="field">
+                          <span>Payment ID (Recipient UUID)</span>
+                          <input
+                            value=${paymentForm.destinationUserId}
+                            onChange=${(event) =>
+                              setPaymentForm((prev) => ({
+                                ...prev,
+                                destinationUserId: event.target.value,
+                              }))}
+                            placeholder="Account UUID"
+                            required
+                          />
+                        </label>
+                        <label class="field">
+                          <span>Amount</span>
+                          <input
+                            value=${paymentForm.amount}
+                            onChange=${(event) =>
+                              setPaymentForm((prev) => ({ ...prev, amount: event.target.value }))}
+                            placeholder="800"
+                            required
+                          />
+                        </label>
+                        <label class="field">
+                          <span>6-Digit Payment PIN</span>
+                          <${SegmentedPinInput}
+                            length=${6}
+                            value=${paymentForm.paymentPin}
+                            onChange=${(value) =>
+                              setPaymentForm((prev) => ({ ...prev, paymentPin: value }))}
+                            name="payment-pin-input"
+                          />
+                        </label>
+                        ${transferError ? html`<div class="error-box">${transferError}</div>` : null}
+                        <button class="primary-button" type="submit" disabled=${transferLoading}>
+                          ${transferLoading ? "Sending..." : "Send Payment"}
+                        </button>
+                      </form>
+                    `}
               </div>
             </div>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-header">
-            <div>
-              <h3>Make a Payment</h3>
-              <p class="muted">POST /accounts/transfer</p>
-            </div>
-          </div>
-
-          <form class="form-stack" onSubmit=${handleTransfer}>
-            <label class="field">
-              <span>Destination User UUID</span>
-              <input
-                value=${paymentForm.destinationUserId}
-                onChange=${(event) =>
-                  setPaymentForm((prev) => ({
-                    ...prev,
-                    destinationUserId: event.target.value,
-                  }))}
-                placeholder="User UUID"
-                required
-              />
-            </label>
-            <label class="field">
-              <span>Amount (INR)</span>
-              <input
-                value=${paymentForm.amount}
-                onChange=${(event) =>
-                  setPaymentForm((prev) => ({
-                    ...prev,
-                    amount: event.target.value,
-                  }))}
-                placeholder="0.00"
-                required
-              />
-            </label>
-            <label class="field">
-              <span>6-digit Payment PIN</span>
-              <input
-                value=${paymentForm.paymentPin}
-                onChange=${(event) =>
-                  setPaymentForm((prev) => ({
-                    ...prev,
-                    paymentPin: event.target.value,
-                  }))}
-                placeholder="000000"
-                required
-              />
-            </label>
-            ${transferError ? html`<div class="error-box">${transferError}</div>` : null}
-            <div class="form-actions">
-              <span class="muted">Amounts are string-based.</span>
-              <button
-                class="primary-button"
-                type="submit"
-                disabled=${transferLoading}
-              >
-                Send Payment
-              </button>
-            </div>
-          </form>
-        </div>
-      </section>
+          `
+        : null}
     </div>
   `;
 };
 
 const root = createRoot(document.getElementById("root"));
-root.render(React.createElement(App));
+root.render(html`<${App} />`);
