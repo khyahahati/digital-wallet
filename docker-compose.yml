@@ -1,0 +1,39 @@
+services:
+  #Database Service
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: wallet_db_container
+    environment:
+      POSTGRES_USER: your_custom_user
+      POSTGRES_PASSWORD: your_secure_password
+      POSTGRES_DB: wallet_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  #Go Backend Service
+  backend:
+    build: ./cmd
+    container_name: wallet_backend_container
+    ports:
+      - "8080:8080"
+    environment:
+      POSTGRES_USER: your_custom_user
+      POSTGRES_PASSWORD: your_secure_password
+      POSTGRES_DB: wallet_db
+      JWT_SECRET: your_super_secure_jwt_signing_key_here
+    depends_on:
+      - postgres-db
+
+  #React Frontend Service
+  frontend:
+    build: ./web
+    container_name: wallet_frontend_container
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
