@@ -855,6 +855,9 @@ const App = () => {
                       : html`
                           <h2 class="section-title">Verification</h2>
                           <div class="progress-pill">2/2</div>
+                          <p className="text-muted text-sm my-2">
+                             Enter the 6-digit code on your Authenticator app to securely log in to your wallet.
+                          </p>
                           <${SegmentedPinInput}
                             length=${6}
                             value=${loginForm.otp}
@@ -919,17 +922,17 @@ const App = () => {
             type="button"
             onClick=${() => setActivePanel("payment")}
           >
-            💸 Make a Payment
+             Make a Payment
           </button>
           <button
             class="ghost-button"
             type="button"
             onClick=${() => setActivePanel("balance")}
           >
-            📊 View Balance
+             View Balance
           </button>
           <button class="ghost-button" type="button" onClick=${clearSession}>
-            🚪 Sign Out
+             Sign Out
           </button>
         </div>
       </header>
