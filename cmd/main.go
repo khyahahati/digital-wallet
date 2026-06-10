@@ -25,6 +25,7 @@ func main() {
 	dbUser := os.Getenv("POSTGRES_USER")
 	dbPassword := os.Getenv("POSTGRES_PASSWORD")
 	dbName := os.Getenv("POSTGRES_DB")
+	dbHost := "postgres-db"
 	apiPort := os.Getenv("API_PORT")
 
 	// Set sensible defaults if keys are missing from the env file
@@ -33,8 +34,7 @@ func main() {
 	if apiPort == "" { apiPort = "8080" }
 
 	// 3. Assemble the connection string
-	connStr := fmt.Sprintf("postgresql://%s:%s@localhost:5432/%s?sslmode=disable", dbUser, dbPassword, dbName)
-
+	connStr := fmt.Sprintf("postgresql://%s:%s@%s:5432/%s?sslmode=disable", dbUser, dbPassword, dbHost, dbName)
 	ctx := context.Background()
 
 	// 4. Initialize the concurrent pgx connection pool
